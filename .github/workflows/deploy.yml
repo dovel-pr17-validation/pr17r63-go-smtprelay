@@ -1,0 +1,80 @@
+name: Deploy
+
+on:
+  push:
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+
+jobs:
+  version:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      short-sha: ${{ steps.version.outputs.short-sha }}
+      go-ldflags: ${{ steps.version.outputs.go-ldflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ./go.mod
+          cache: false
+      - name: get version numbers
+        id: version
+        run: |
+          echo "short-sha=$(echo ${{ github.sha }} | cut -c 1-7)" >> $GITHUB_OUTPUT
+          echo "version=$(go run ./scripts/version.go)" >> $GITHUB_OUTPUT
+          echo "go-ldflags=$(go run ./scripts/version.go -g)" >> $GITHUB_OUTPUT
+      - name: print version outputs
+        run: |
+          echo "version: ${{ steps.version.outputs.version }}"
+          echo "short-sha: ${{ steps.version.outputs.short-sha }}"
+          echo "go-ldflags: ${{ steps.version.outputs.go-ldflags }}"
+  push-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    needs: version
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: grafana/shared-workflows/actions/docker-build-push-image@317d86931c8deacf670ceed195a81acebce14033 # docker-build-push-image/v1.0
+        id: push
+        with:
+          registries: gar
+          gar-environment: prod
+          gar-repository: dockerhub-smtprelay-prod-mirror
+          platforms: linux/amd64
+          push: "true"
+          build-args: |-
+            GIT_REVISION=${{ needs.version.outputs.short-sha }}
+            VERSION=${{ needs.version.outputs.version }}
+            "GO_LDFLAGS=${{ needs.version.outputs.go-ldflags }}"
+          tags: |-
+            ${{ needs.version.outputs.version }}
+  deploy-dev:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    environment:
+      name: dev
+    needs: [version, push-docker]
+    steps:
+      - name: Trigger CD workflow
+        uses: grafana/shared-workflows/actions/trigger-argo-workflow@030bdd10e567ae3cc62533c5b356dd151e96e323 # main
+        with:
+          instance: ops
+          namespace: hosted-grafana-cd
+          workflow_template: smtprelay
+          parameters: |
+            dockertag=${{ needs.version.outputs.version }}
